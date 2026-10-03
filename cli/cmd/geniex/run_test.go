@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 
 	"github.com/openai/openai-go/v3"
@@ -88,5 +89,60 @@ func TestRunHistoryRetriesStreamPromptError(t *testing.T) {
 		}, func(err error) bool { return errors.Is(err, geniex_sdk.ErrLlmGenerationPromptTooLong) })
 	if err != nil || text != "ok" || dropped != 1 || len(kept) != 1 || requests != 2 {
 		t.Fatalf("text=%q dropped=%d kept=%d requests=%d err=%v", text, dropped, len(kept), requests, err)
+	}
+}
+
+func TestRunCompletionsContinuesAfterContextOverflow(t *testing.T) {
+	oldClient, oldPrompt, oldSystemPrompt := client, prompt, systemPrompt
+	defer func() {
+		client, prompt, systemPrompt = oldClient, oldPrompt, oldSystemPrompt
+	}()
+	prompt = []string{"old", "current", "next"}
+	systemPrompt = "rules"
+
+	var requests [][]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		roles := make([]string, len(body.Messages))
+		for i, message := range body.Messages {
+			roles[i] = message.Role + ":" + message.Content
+		}
+		requests = append(requests, roles)
+		if len(requests) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, "null")
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		if len(requests) == 3 {
+			fmt.Fprint(w, "data: {\"error\":\"Input prompt too long\",\"code\":-200103}\n\n")
+			return
+		}
+		fmt.Fprint(w, "data: {\"id\":\"test\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer server.Close()
+	client = openai.NewClient(option.WithBaseURL(server.URL + "/v1"))
+
+	if err := runCompletions(context.Background(), "test", geniex_sdk.ModelTypeLLM); err != nil {
+		t.Fatalf("runCompletions: %v", err)
+	}
+	want := [][]string{
+		{"system:rules"},
+		{"system:rules", "user:old"},
+		{"system:rules", "user:old", "assistant:ok", "user:current"},
+		{"system:rules", "user:current"},
+		{"system:rules", "user:current", "assistant:ok", "user:next"},
+	}
+	if !reflect.DeepEqual(requests, want) {
+		t.Fatalf("requests = %v, want %v", requests, want)
 	}
 }
